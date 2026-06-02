@@ -1,17 +1,16 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from picamera2 import Picamera2
 import asyncio
 import cv2
 import numpy as np
 import base64
-import time
 import threading
+import json
 import os
+import paho.mqtt.client as mqtt
 from datetime import datetime
 from database import init_db, get_db
-from detector import PersonDetector
 
 app = FastAPI()
 
@@ -22,53 +21,99 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 전역 상태
-detector = None
-picam2 = None
-person_start_time = None
-is_recording = False
-recording_frames = []
+# ── 전역 상태 ──
 active_connections = []
-THRESHOLD_SEC = 20
-CLIPS_DIR = "clips"
 latest_frame = None
 
-def init():
-    global detector, picam2
-    init_db()
-    detector = PersonDetector()
-    picam2 = Picamera2()
-    config = picam2.create_preview_configuration(
-        main={"size": (640, 480), "format": "RGB888"}
-    )
-    picam2.configure(config)
-    picam2.start()
-    time.sleep(1)
-    print("카메라 초기화 완료")
+detection_state = {
+    "pir_detected": False,
+    "person_detected": False,
+    "is_recording": False,
+    "duration": 0,
+    "distance": 0,
+    "door_open": False,
+    "last_event": None,
+}
 
-def save_clip(frames):
-    if not frames:
-        return None
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    clip_path = f"{CLIPS_DIR}/{timestamp}.avi"
-    h, w = frames[0].shape[:2]
-    out = cv2.VideoWriter(clip_path, cv2.VideoWriter_fourcc(*'XVID'), 10, (w, h))
-    for frame in frames:
-        out.write(frame)
-    out.release()
-    return clip_path
+# ── MQTT 콜백 ──
+def on_frame(client, userdata, msg):
+    global latest_frame
+    try:
+        data = base64.b64decode(msg.payload)
+        arr = np.frombuffer(data, np.uint8)
+        latest_frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except:
+        pass
 
-def save_event(duration, clip_path):
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO events (timestamp, duration_sec, clip_path)
-        VALUES (?, ?, ?)
-    ''', (datetime.now().isoformat(), duration, clip_path))
-    conn.commit()
-    event_id = cursor.lastrowid
-    conn.close()
-    return event_id
+def on_pir(client, userdata, msg):
+    data = json.loads(msg.payload)
+    detection_state["pir_detected"] = data.get("detected", False)
+
+def on_ultrasonic(client, userdata, msg):
+    data = json.loads(msg.payload)
+    detection_state["distance"] = data.get("distance", 0)
+
+def on_door(client, userdata, msg):
+    data = json.loads(msg.payload)
+    detection_state["door_open"] = data.get("open", False)
+    if data.get("open"):
+        try:
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO events (timestamp, duration_sec, clip_path, event_type)
+                VALUES (?, ?, ?, ?)
+            ''', (data.get("timestamp"), 0, None, "door_open"))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"DB 오류: {e}")
+
+def on_detection(client, userdata, msg):
+    data = json.loads(msg.payload)
+    detection_state["last_event"] = data
+    detection_state["person_detected"] = False
+    detection_state["is_recording"] = False
+    detection_state["duration"] = 0
+
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO events (timestamp, duration_sec, clip_path, snapshot_path, event_type)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (
+            data.get("timestamp"),
+            data.get("duration", 0),
+            data.get("clip_path"),
+            data.get("snapshot_path"),
+            "detection"
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"DB 오류: {e}")
+
+def on_status(client, userdata, msg):
+    data = json.loads(msg.payload)
+    detection_state["person_detected"] = data.get("person_detected", False)
+    detection_state["is_recording"] = data.get("is_recording", False)
+    detection_state["duration"] = data.get("duration", 0)
+
+# ── MQTT 설정 ──
+def setup_mqtt():
+    mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    mqtt_client.message_callback_add("doorguard/frame", on_frame)
+    mqtt_client.message_callback_add("doorguard/pir", on_pir)
+    mqtt_client.message_callback_add("doorguard/ultrasonic", on_ultrasonic)
+    mqtt_client.message_callback_add("doorguard/door", on_door)
+    mqtt_client.message_callback_add("doorguard/detection", on_detection)
+    mqtt_client.message_callback_add("doorguard/status", on_status)
+    mqtt_client.connect("localhost", 1883, 60)
+    mqtt_client.subscribe("doorguard/#")
+    mqtt_client.loop_start()
+    print("MQTT 구독 시작!")
+    return mqtt_client
 
 async def notify_clients(message):
     for ws in active_connections:
@@ -77,69 +122,15 @@ async def notify_clients(message):
         except:
             pass
 
-def detection_loop():
-    global person_start_time, is_recording, recording_frames, latest_frame
-    buffer_frames = []
-    BUFFER_SEC = 5
-    FPS = 10
-
-    while True:
-        if picam2 is None:
-            time.sleep(0.1)
-            continue
-
-        frame = picam2.capture_array()
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        latest_frame = frame_bgr.copy()
-
-        # 버퍼 유지 (감지 전 5초)
-        buffer_frames.append(frame_bgr.copy())
-        if len(buffer_frames) > BUFFER_SEC * FPS:
-            buffer_frames.pop(0)
-
-        person_detected = detector.detect(frame_bgr)
-
-        if person_detected:
-            if person_start_time is None:
-                person_start_time = time.time()
-                recording_frames = buffer_frames.copy()
-                print("사람 감지 시작!")
-
-            duration = time.time() - person_start_time
-            recording_frames.append(frame_bgr.copy())
-
-            if duration >= THRESHOLD_SEC and not is_recording:
-                is_recording = True
-                print(f"배회 감지! {duration:.1f}초 경과")
-
-        else:
-            if person_start_time is not None:
-                duration = time.time() - person_start_time
-                if is_recording:
-                    clip_path = save_clip(recording_frames)
-                    save_event(duration, clip_path)
-                    print(f"클립 저장 완료: {clip_path}")
-                person_start_time = None
-                is_recording = False
-                recording_frames = []
-
-        time.sleep(1.0 / FPS)
-
 @app.on_event("startup")
 async def startup():
-    init()
-    thread = threading.Thread(target=detection_loop, daemon=True)
-    thread.start()
-    print("DoorGuard 서버 시작!")
+    init_db()
+    setup_mqtt()
+    print("DoorGuard v2.0 서버 시작!")
 
 @app.get("/api/status")
 async def get_status():
-    return {
-        "status": "running",
-        "person_detected": person_start_time is not None,
-        "is_recording": is_recording,
-        "duration": round(time.time() - person_start_time, 1) if person_start_time else 0
-    }
+    return detection_state
 
 @app.get("/api/events")
 async def get_events():
@@ -154,9 +145,33 @@ async def get_events():
 async def get_frame():
     if latest_frame is None:
         return JSONResponse({"error": "프레임 없음"})
-    _, buffer = cv2.imencode('.jpg', latest_frame)
+    _, buffer = cv2.imencode('.jpg', latest_frame,
+                             [cv2.IMWRITE_JPEG_QUALITY, 60])
     img_base64 = base64.b64encode(buffer).decode('utf-8')
     return {"image": img_base64}
+
+@app.get("/api/clips/{filename}")
+async def get_clip(filename: str):
+    path = f"clips/{filename}"
+    if not os.path.exists(path):
+        return JSONResponse({"error": "파일 없음"})
+    return FileResponse(path, media_type="video/x-msvideo", filename=filename)
+
+@app.get("/api/snapshots/{filename}")
+async def get_snapshot(filename: str):
+    path = f"snapshots/{filename}"
+    if not os.path.exists(path):
+        return JSONResponse({"error": "파일 없음"})
+    return FileResponse(path, media_type="image/jpeg")
+
+@app.get("/api/faces")
+async def get_faces():
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM faces ORDER BY last_seen DESC")
+    faces = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return faces
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -164,19 +179,15 @@ async def websocket_endpoint(websocket: WebSocket):
     active_connections.append(websocket)
     try:
         while True:
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.1)
             if latest_frame is not None:
                 _, buffer = cv2.imencode('.jpg', latest_frame,
-                                         [cv2.IMWRITE_JPEG_QUALITY, 50])
+                                         [cv2.IMWRITE_JPEG_QUALITY, 60])
                 img_base64 = base64.b64encode(buffer).decode('utf-8')
                 await websocket.send_json({
                     "type": "frame",
                     "image": img_base64,
-                    "status": {
-                        "person_detected": person_start_time is not None,
-                        "is_recording": is_recording,
-                        "duration": round(time.time() - person_start_time, 1) if person_start_time else 0
-                    }
+                    "status": detection_state
                 })
     except WebSocketDisconnect:
         active_connections.remove(websocket)

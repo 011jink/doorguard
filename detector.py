@@ -1,10 +1,9 @@
 import cv2
 import numpy as np
-import time
 from tflite_runtime.interpreter import Interpreter
 
 MODEL_PATH = "yolov8n_float32.tflite"
-CONFIDENCE_THRESHOLD = 0.5
+CONFIDENCE_THRESHOLD = 0.3
 PERSON_CLASS_ID = 0
 
 class PersonDetector:

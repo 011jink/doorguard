@@ -1,0 +1,196 @@
+
+import time
+import json
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+import paho.mqtt.client as mqtt
+from picamera2 import Picamera2
+from detector import PersonDetector
+from datetime import datetime
+
+# ── GPIO 핀 설정 ──
+PIR_PIN = 17
+TRIG_PIN = 23  # 초음파 TRIG
+ECHO_PIN = 24  # 초음파 ECHO
+DOOR_PIN = 25  # 리드 스위치
+
+# ── MQTT 설정 ──
+BROKER = "localhost"
+TOPIC_PIR = "doorguard/pir"
+TOPIC_ULTRA = "doorguard/ultrasonic"
+TOPIC_DOOR = "doorguard/door"
+TOPIC_DETECTION = "doorguard/detection"
+
+# ── 설정값 ──
+THRESHOLD_SEC = 1
+DISTANCE_THRESHOLD = 150  # 150cm 이내만 유효
+CLIPS_DIR = "clips"
+SNAPSHOTS_DIR = "snapshots"
+
+import os
+os.makedirs(CLIPS_DIR, exist_ok=True)
+os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+
+# ── GPIO 초기화 ──
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(PIR_PIN, GPIO.IN)
+GPIO.setup(TRIG_PIN, GPIO.OUT)
+GPIO.setup(ECHO_PIN, GPIO.IN)
+GPIO.setup(DOOR_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+# ── 카메라 초기화 ──
+picam2 = Picamera2()
+config = picam2.create_preview_configuration(
+    main={"size": (640, 480), "format": "RGB888"}
+)
+picam2.configure(config)
+picam2.start()
+time.sleep(1)
+
+# ── TFLite 초기화 ──
+detector = PersonDetector()
+
+# ── MQTT 클라이언트 ──
+client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+client.connect(BROKER, 1883, 60)
+client.loop_start()
+
+print("sensor_agent 시작!")
+
+def get_distance():
+    """초음파 센서로 거리 측정 (cm)"""
+    GPIO.output(TRIG_PIN, True)
+    time.sleep(0.00001)
+    GPIO.output(TRIG_PIN, False)
+    start = time.time()
+    stop = time.time()
+    while GPIO.input(ECHO_PIN) == 0:
+        start = time.time()
+    while GPIO.input(ECHO_PIN) == 1:
+        stop = time.time()
+    elapsed = stop - start
+    distance = (elapsed * 34300) / 2
+    return round(distance, 1)
+
+def save_snapshot(frame):
+    """스냅샷 저장 (AI 추론용)"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = f"{SNAPSHOTS_DIR}/{timestamp}.jpg"
+    cv2.imwrite(path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    return path
+
+def save_clip(frames):
+    """영상 클립 저장"""
+    if not frames:
+        return None
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = f"{CLIPS_DIR}/{timestamp}.avi"
+    h, w = frames[0].shape[:2]
+    out = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'XVID'), 10, (w, h))
+    for f in frames:
+        out.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+    out.release()
+    return path
+
+# ── 문 열림 감지 인터럽트 ──
+door_open = False
+def door_callback(channel):
+    global door_open
+    door_open = GPIO.input(DOOR_PIN) == GPIO.LOW
+    payload = json.dumps({
+        "open": door_open,
+        "timestamp": datetime.now().isoformat()
+    })
+    client.publish(TOPIC_DOOR, payload)
+    print(f"문 {'열림' if door_open else '닫힘'} 감지!")
+
+GPIO.add_event_detect(DOOR_PIN, GPIO.BOTH,
+                      callback=door_callback, bouncetime=200)
+
+# ── 메인 감지 루프 ──
+person_start_time = None
+is_recording = False
+recording_frames = []
+buffer_frames = []
+snapshot_taken = False
+BUFFER_SEC = 5
+FPS = 10
+
+try:
+    while True:
+        frame = picam2.capture_array()
+        buffer_frames.append(frame.copy())
+        if len(buffer_frames) > BUFFER_SEC * FPS:
+            buffer_frames.pop(0)
+
+        pir = GPIO.input(PIR_PIN)
+
+        if pir:
+            # 초음파 거리 측정
+            try:
+                distance = get_distance()
+            except:
+                distance = 999
+
+            client.publish(TOPIC_PIR, json.dumps({"detected": True}))
+            client.publish(TOPIC_ULTRA, json.dumps({"distance": distance}))
+
+            # 거리 이내일 때만 AI 추론
+            if distance <= DISTANCE_THRESHOLD:
+                person = detector.detect(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+
+                if person:
+                    if person_start_time is None:
+                        person_start_time = time.time()
+                        recording_frames = buffer_frames.copy()
+                        snapshot_taken = False
+                        print("사람 감지 시작!")
+
+                    duration = time.time() - person_start_time
+                    recording_frames.append(frame.copy())
+
+                    # 스냅샷 1회만 촬영 (AI 추론용)
+                    if not snapshot_taken:
+                        snapshot_path = save_snapshot(frame)
+                        snapshot_taken = True
+                        print(f"스냅샷 저장: {snapshot_path}")
+
+                    if duration >= THRESHOLD_SEC and not is_recording:
+                        is_recording = True
+                        print(f"배회 감지! {duration:.1f}초")
+
+                else:
+                    if person_start_time is not None:
+                        duration = time.time() - person_start_time
+                        clip_path = None
+                        snap_path = None
+
+                        if is_recording:
+                            clip_path = save_clip(recording_frames)
+                            snap_path = f"{SNAPSHOTS_DIR}/{clip_path.split('/')[-1].replace('.avi', '.jpg')}"
+
+                        payload = json.dumps({
+                            "duration": round(duration, 1),
+                            "clip_path": clip_path,
+                            "snapshot_path": snap_path,
+                            "timestamp": datetime.now().isoformat()
+                        })
+                        client.publish(TOPIC_DETECTION, payload)
+                        print(f"감지 종료 → MQTT 발행")
+
+                        person_start_time = None
+                        is_recording = False
+                        recording_frames = []
+                        snapshot_taken = False
+        else:
+            client.publish(TOPIC_PIR, json.dumps({"detected": False}))
+
+        time.sleep(1.0 / FPS)
+
+except KeyboardInterrupt:
+    print("sensor_agent 종료")
+finally:
+    picam2.stop()
+    GPIO.cleanup()
+    client.loop_stop()
